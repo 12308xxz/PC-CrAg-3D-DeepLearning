@@ -1,0 +1,21 @@
+# Patient data, generated outputs, checkpoints and local artifacts
+data/
+runs/
+checkpoints/
+*.pth
+*.pt
+*.npz
+*.nrrd
+*.dcm
+*.nii
+*.nii.gz
+*.csv
+!requirements.txt
+*fail_log*.txt
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.idea/
+.vscode/
