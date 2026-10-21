@@ -1,10 +1,24 @@
-"""Resample CT and lesion mask, crop lesion context, and write compressed NPZ.
+"""Preprocess paired CT/lesion-mask NRRDs into lesion-context CT crops.
 
-Requires inputs in NRRD format and split CSV columns patient_id,label,split.
-Patient identifiers are read locally and MUST NOT be distributed in public examples.
+This implementation follows the user-confirmed research preprocessing:
+- Resample CT and mask separately to 1 mm isotropic resolution.
+- Determine the 3D ROI bounding box from the (nearest-neighbor) mask.
+- Enlarge EACH bounding-box dimension by 1.8 (no minimum crop size).
+- Clip a boundary-adjusted CT crop, including surrounding tissue.
+- Window to [-1000, 400] HU, normalize to [0, 1], and resize to
+  (D, H, W) = (32, 128, 128) with linear interpolation.
+
+The mask guides cropping only. Neither a binary-mask channel nor physical
+lesion diameter/volume is supplied as an input to the image model.
+
+This script assumes the input CT and mask share physical geometry and uses
+shape agreement after resampling as in the original research script; users
+must validate their spatial alignment before using the preprocessing output.
+Do NOT commit any patient data, names, output NPZ files, or failure logs.
 """
 import argparse
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import SimpleITK as sitk
@@ -12,9 +26,12 @@ from tqdm import tqdm
 
 
 def resample_to_isotropic(image, target_spacing=(1.0, 1.0, 1.0), is_label=False):
-    original_spacing, original_size = image.GetSpacing(), image.GetSize()
-    new_size = [max(1, int(round(original_size[i] * original_spacing[i] / target_spacing[i])))
-                for i in range(3)]
+    original_spacing = image.GetSpacing()
+    original_size = image.GetSize()
+    new_size = [
+        int(round(original_size[i] * (original_spacing[i] / target_spacing[i])))
+        for i in range(3)
+    ]
     resampler = sitk.ResampleImageFilter()
     resampler.SetSize(new_size)
     resampler.SetOutputSpacing(target_spacing)
@@ -24,34 +41,60 @@ def resample_to_isotropic(image, target_spacing=(1.0, 1.0, 1.0), is_label=False)
     return resampler.Execute(image)
 
 
-def window_ct(volume, low=-1000, high=400):
-    volume = np.clip(volume, low, high)
-    return ((volume - low) / (high - low + 1e-8)).astype(np.float32)
+def window_ct(vol, w_min=-1000, w_max=400):
+    vol = np.clip(vol, w_min, w_max)
+    return ((vol - w_min) / (w_max - w_min + 1e-8)).astype(np.float32)
 
 
 def find_3d_bbox(mask):
     zs, ys, xs = np.where(mask > 0)
-    if len(xs) == 0:
+    if len(xs) == 0 or len(ys) == 0 or len(zs) == 0:
         return None
     return int(zs.min()), int(zs.max() + 1), int(ys.min()), int(ys.max() + 1), int(xs.min()), int(xs.max() + 1)
 
 
-def expand_bbox_3d(bbox, vol_shape, context_scale=1.8, min_crop_size=(16, 96, 96)):
+def expand_bbox_3d(bbox, vol_shape, context_scale=1.8):
+    """Expand ROI bounding box by 1.8x per axis; no min_crop_size.
+
+    The boundary shifts reproduce the original preprocessing implementation.
+    Crop coordinates are NumPy half-open intervals in (D,H,W) order.
+    """
     D, H, W = vol_shape
     z1, z2, y1, y2, x1, x2 = bbox
     dz, dy, dx = z2 - z1, y2 - y1, x2 - x1
-    cz, cy, cx = (z1 + z2)/2, (y1 + y2)/2, (x1 + x2)/2
-    nd = max(int(round(dz * context_scale)), min_crop_size[0])
-    nh = max(int(round(dy * context_scale)), min_crop_size[1])
-    nw = max(int(round(dx * context_scale)), min_crop_size[2])
-    nz1, ny1, nx1 = (int(round(cz - nd/2)), int(round(cy - nh/2)), int(round(cx - nw/2)))
-    nz2, ny2, nx2 = nz1 + nd, ny1 + nh, nx1 + nw
-    if nz1 < 0: nz2 -= nz1; nz1 = 0
-    if ny1 < 0: ny2 -= ny1; ny1 = 0
-    if nx1 < 0: nx2 -= nx1; nx1 = 0
-    if nz2 > D: nz1 -= nz2 - D; nz2 = D
-    if ny2 > H: ny1 -= ny2 - H; ny2 = H
-    if nx2 > W: nx1 -= nx2 - W; nx2 = W
+    cz, cy, cx = (z1 + z2)/2.0, (y1 + y2)/2.0, (x1 + x2)/2.0
+
+    new_d = max(int(round(dz * context_scale)), 1)
+    new_h = max(int(round(dy * context_scale)), 1)
+    new_w = max(int(round(dx * context_scale)), 1)
+
+    nz1 = int(round(cz - new_d / 2)); nz2 = nz1 + new_d
+    ny1 = int(round(cy - new_h / 2)); ny2 = ny1 + new_h
+    nx1 = int(round(cx - new_w / 2)); nx2 = nx1 + new_w
+
+    if nz1 < 0:
+        nz2 -= nz1
+        nz1 = 0
+    if ny1 < 0:
+        ny2 -= ny1
+        ny1 = 0
+    if nx1 < 0:
+        nx2 -= nx1
+        nx1 = 0
+
+    if nz2 > D:
+        shift = nz2 - D
+        nz1 -= shift
+        nz2 = D
+    if ny2 > H:
+        shift = ny2 - H
+        ny1 -= shift
+        ny2 = H
+    if nx2 > W:
+        shift = nx2 - W
+        nx1 -= shift
+        nx2 = W
+
     nz1, ny1, nx1 = max(0, nz1), max(0, ny1), max(0, nx1)
     nz2, ny2, nx2 = min(D, nz2), min(H, ny2), min(W, nx2)
     return nz1, nz2, ny1, ny2, nx1, nx2
@@ -75,56 +118,57 @@ def preprocess_one(patient_id, label, split, args, failures):
     class_folder = args.neg_folder if label == 0 else args.pos_folder
     patient_dir = Path(args.raw_root) / class_folder / patient_id
     ct_path, mask_path = patient_dir / args.ct_filename, patient_dir / args.mask_filename
-    if not ct_path.exists() or not mask_path.exists():
-        failures.append(f"Missing CT or mask: {patient_id}")
+    if not patient_dir.exists():
+        failures.append(f"[NoPatientDir] {patient_id} | {patient_dir}")
+        return
+    if not ct_path.exists():
+        failures.append(f"[NoCT] {patient_id} | {ct_path}")
+        return
+    if not mask_path.exists():
+        failures.append(f"[NoMask] {patient_id} | {mask_path}")
         return
     try:
-        ct = sitk.ReadImage(str(ct_path))
-        mask = sitk.ReadImage(str(mask_path))
-        # Assumes original CT and mask share the same physical geometry.
-        # Verify alignment before resampling, rather than silently misaligning them.
-        if (ct.GetSize() != mask.GetSize()
-                or not np.allclose(ct.GetSpacing(), mask.GetSpacing())
-                or not np.allclose(ct.GetOrigin(), mask.GetOrigin())
-                or not np.allclose(ct.GetDirection(), mask.GetDirection())):
-            failures.append(f"Geometry mismatch: {patient_id}")
-            return
-        ct = resample_to_isotropic(ct, (1.0, 1.0, 1.0), False)
-        mask = resample_to_isotropic(mask, (1.0, 1.0, 1.0), True)
-        ct_vol, mask_vol = sitk.GetArrayFromImage(ct), sitk.GetArrayFromImage(mask)
+        ct_img = sitk.ReadImage(str(ct_path))
+        mask_img = sitk.ReadImage(str(mask_path))
+        ct_img = resample_to_isotropic(ct_img, (1.0, 1.0, 1.0), False)
+        mask_img = resample_to_isotropic(mask_img, (1.0, 1.0, 1.0), True)
+        ct_vol = sitk.GetArrayFromImage(ct_img)
+        mask_vol = sitk.GetArrayFromImage(mask_img)
         if ct_vol.shape != mask_vol.shape:
-            failures.append(f"Resampled shape mismatch: {patient_id}")
+            failures.append(f"[ShapeMismatch] {patient_id} | ct={ct_vol.shape} mask={mask_vol.shape}")
             return
         bbox = find_3d_bbox(mask_vol)
         if bbox is None:
-            failures.append(f"Empty mask: {patient_id}")
+            failures.append(f"[EmptyMask] {patient_id}")
             return
-        crop_box = expand_bbox_3d(bbox, ct_vol.shape, context_scale=1.8,
-                                  min_crop_size=(16, 96, 96))
+        crop_box = expand_bbox_3d(bbox, ct_vol.shape, context_scale=1.8)
         z1, z2, y1, y2, x1, x2 = crop_box
-        crop = window_ct(ct_vol[z1:z2, y1:y2, x1:x2])
+        crop = ct_vol[z1:z2, y1:y2, x1:x2]
+        crop = window_ct(crop, -1000, 400)
         crop = resize_3d_volume(crop, (32, 128, 128))
         class_name = "negative" if label == 0 else "positive"
         out_dir = Path(args.output_root) / split / class_name
         out_dir.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(out_dir / f"{patient_id}.npz",
-                            volume=crop, label=np.int64(label), patient_id=str(patient_id),
-                            crop_box=np.asarray(crop_box, dtype=np.int32),
-                            original_shape=np.asarray(ct_vol.shape, dtype=np.int32))
+        np.savez_compressed(
+            out_dir / f"{patient_id}.npz", volume=crop.astype(np.float32),
+            label=np.int64(label), patient_id=patient_id,
+            crop_box=np.array(crop_box, dtype=np.int32),
+            original_shape=np.array(ct_vol.shape, dtype=np.int32),
+        )
     except Exception as exc:
-        failures.append(f"Failed patient {patient_id}: {type(exc).__name__}: {exc}")
+        failures.append(f"[Exception] {patient_id} | {repr(exc)}")
 
 
 def main():
-    p = argparse.ArgumentParser(description="Build 3D ROI crops from NRRD CT/masks")
-    p.add_argument("--raw-root", required=True)
-    p.add_argument("--split-csv", required=True)
-    p.add_argument("--output-root", default="data/processed")
-    p.add_argument("--neg-folder", default="3A")
-    p.add_argument("--pos-folder", default="4A")
-    p.add_argument("--ct-filename", default="lung.nrrd")
-    p.add_argument("--mask-filename", default="lung-label.nrrd")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="Preprocess ROI-guided 3D CT crops without a minimum crop size")
+    parser.add_argument("--raw-root", required=True)
+    parser.add_argument("--split-csv", required=True)
+    parser.add_argument("--output-root", default="data/processed")
+    parser.add_argument("--neg-folder", default="3A")
+    parser.add_argument("--pos-folder", default="4A")
+    parser.add_argument("--ct-filename", default="lung.nrrd")
+    parser.add_argument("--mask-filename", default="lung-label.nrrd")
+    args = parser.parse_args()
     df = pd.read_csv(args.split_csv, dtype={"patient_id": str})
     required = {"patient_id", "label", "split"}
     if not required.issubset(df.columns):
@@ -137,10 +181,8 @@ def main():
     for row in tqdm(df.itertuples(index=False), total=len(df), desc="Preprocessing"):
         preprocess_one(str(row.patient_id), int(row.label), str(row.split), args, failures)
     Path(args.output_root).mkdir(parents=True, exist_ok=True)
-    # IDs in failure logs are private; file is stored locally and ignored by git.
     (Path(args.output_root) / "build_3d_fail_log.txt").write_text("\n".join(failures), encoding="utf-8")
-    print(f"Processed {len(df) - len(failures)}/{len(df)} files. Failures: {len(failures)}")
-
+    print(f"Processed {len(df)-len(failures)}/{len(df)} files. Failures: {len(failures)}")
 
 if __name__ == "__main__":
     main()
